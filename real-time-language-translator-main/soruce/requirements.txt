@@ -1,0 +1,9 @@
+Flask==2.3.3
+Flask-CORS==4.0.0
+googletrans==4.0.0rc1
+gTTS==2.3.2
+SpeechRecognition==3.10.0
+PyAudio==0.2.13
+python-dotenv==1.0.0
+mysql-connector-python==8.2.0
+Werkzeug==2.3.7
