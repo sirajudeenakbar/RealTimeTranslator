@@ -46,6 +46,13 @@ const LanguageTranslator = () => {
         setCurrentUser(userData);
         setUserName(userData.fullName || userData.firstName || 'User');
         setUserEmail(userData.email || 'user@translator.com');
+        
+        // Sync user profile data from server
+        syncUserProfile(userData.email);
+        
+        // Load user's translation history and preferences
+        loadUserHistory(userData.email);
+        
       } catch (err) {
         console.error('Error parsing user data:', err);
         localStorage.removeItem('user');
@@ -53,6 +60,117 @@ const LanguageTranslator = () => {
       }
     }
   }, []);
+
+  // Function to sync user profile with server
+  const syncUserProfile = async (email) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/users/profile/sync`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Email': email
+        },
+        body: JSON.stringify({ user_email: email })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success && data.profile_data) {
+          // Apply user preferences to UI
+          const prefs = data.profile_data.user_preferences;
+          
+          // Set language preferences if they exist
+          if (prefs?.translation?.preferred_source_lang) {
+            setSourceLang(prefs.translation.preferred_source_lang);
+          }
+          if (prefs?.translation?.preferred_target_lang) {
+            setTargetLang(prefs.translation.preferred_target_lang);
+          }
+          
+          console.log('User profile synced successfully');
+        }
+      } else if (response.status === 404) {
+        // User profile not found, this is expected for new users
+        console.log('New user detected, profile will be created on first translation');
+      } else {
+        console.warn('Profile sync failed with status:', response.status);
+      }
+    } catch (error) {
+      console.error('Error syncing user profile:', error);
+      // Continue without profile sync - not critical for basic functionality
+    }
+  };
+
+  // Function to load user's translation history
+  const loadUserHistory = async (email) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/users/history?per_page=20`, {
+        headers: {
+          'X-User-Email': email
+        }
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success && data.translations) {
+          // Convert server format to app format
+          const formattedHistory = data.translations.map(t => ({
+            id: t.id,
+            text: t.original_text,
+            translation: t.translated_text,
+            sourceLang: t.source_language,
+            targetLang: t.target_language,
+            timestamp: new Date(t.created_at)
+          }));
+          
+          setHistory(formattedHistory);
+          console.log(`Loaded ${formattedHistory.length} translations from history`);
+        }
+      } else if (response.status === 404) {
+        // No history found - normal for new users
+        console.log('No translation history found for user');
+      }
+    } catch (error) {
+      console.error('Error loading user history:', error);
+      // Continue without history - not critical for basic functionality
+    }
+  };
+
+  // Function to save user preferences
+  const saveUserPreference = async (key, value, category = 'general') => {
+    if (!currentUser?.email) return;
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/users/preferences/${key}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Email': currentUser.email
+        },
+        body: JSON.stringify({
+          value: value,
+          category: category
+        })
+      });
+
+      if (response.ok) {
+        console.log(`Preference ${key} saved successfully`);
+      }
+    } catch (error) {
+      console.error('Error saving preference:', error);
+    }
+  };
+
+  // Function to handle language change and save preference
+  const handleSourceLangChange = (lang) => {
+    setSourceLang(lang);
+    saveUserPreference('preferred_source_lang', lang, 'translation');
+  };
+
+  const handleTargetLangChange = (lang) => {
+    setTargetLang(lang);
+    saveUserPreference('preferred_target_lang', lang, 'translation');
+  };
 
   const languages = [
     { code: 'en', name: 'English' },
@@ -64,9 +182,81 @@ const LanguageTranslator = () => {
     { code: 'ru', name: 'Russian' },
     { code: 'ja', name: 'Japanese' },
     { code: 'ko', name: 'Korean' },
-    { code: 'zh', name: 'Chinese' },
+    { code: 'zh', name: 'Chinese (Simplified)' },
+    { code: 'zh-tw', name: 'Chinese (Traditional)' },
     { code: 'ar', name: 'Arabic' },
-    { code: 'hi', name: 'Hindi' }
+    { code: 'hi', name: 'Hindi' },
+    { code: 'bn', name: 'Bengali' },
+    { code: 'ta', name: 'Tamil' },
+    { code: 'te', name: 'Telugu' },
+    { code: 'ml', name: 'Malayalam' },
+    { code: 'kn', name: 'Kannada' },
+    { code: 'gu', name: 'Gujarati' },
+    { code: 'mr', name: 'Marathi' },
+    { code: 'pa', name: 'Punjabi' },
+    { code: 'ur', name: 'Urdu' },
+    { code: 'si', name: 'Sinhala' },
+    { code: 'th', name: 'Thai' },
+    { code: 'vi', name: 'Vietnamese' },
+    { code: 'id', name: 'Indonesian' },
+    { code: 'ms', name: 'Malay' },
+    { code: 'tl', name: 'Filipino' },
+    { code: 'sw', name: 'Swahili' },
+    { code: 'tr', name: 'Turkish' },
+    { code: 'pl', name: 'Polish' },
+    { code: 'nl', name: 'Dutch' },
+    { code: 'sv', name: 'Swedish' },
+    { code: 'da', name: 'Danish' },
+    { code: 'no', name: 'Norwegian' },
+    { code: 'fi', name: 'Finnish' },
+    { code: 'is', name: 'Icelandic' },
+    { code: 'cs', name: 'Czech' },
+    { code: 'sk', name: 'Slovak' },
+    { code: 'hu', name: 'Hungarian' },
+    { code: 'ro', name: 'Romanian' },
+    { code: 'bg', name: 'Bulgarian' },
+    { code: 'hr', name: 'Croatian' },
+    { code: 'sr', name: 'Serbian' },
+    { code: 'sl', name: 'Slovenian' },
+    { code: 'lt', name: 'Lithuanian' },
+    { code: 'lv', name: 'Latvian' },
+    { code: 'et', name: 'Estonian' },
+    { code: 'uk', name: 'Ukrainian' },
+    { code: 'be', name: 'Belarusian' },
+    { code: 'ka', name: 'Georgian' },
+    { code: 'am', name: 'Amharic' },
+    { code: 'he', name: 'Hebrew' },
+    { code: 'fa', name: 'Persian' },
+    { code: 'ps', name: 'Pashto' },
+    { code: 'ku', name: 'Kurdish' },
+    { code: 'az', name: 'Azerbaijani' },
+    { code: 'uz', name: 'Uzbek' },
+    { code: 'kk', name: 'Kazakh' },
+    { code: 'ky', name: 'Kyrgyz' },
+    { code: 'tg', name: 'Tajik' },
+    { code: 'mn', name: 'Mongolian' },
+    { code: 'my', name: 'Myanmar (Burmese)' },
+    { code: 'km', name: 'Khmer' },
+    { code: 'lo', name: 'Lao' },
+    { code: 'ne', name: 'Nepali' },
+    { code: 'dz', name: 'Dzongkha' },
+    { code: 'bo', name: 'Tibetan' },
+    { code: 'yo', name: 'Yoruba' },
+    { code: 'ig', name: 'Igbo' },
+    { code: 'ha', name: 'Hausa' },
+    { code: 'zu', name: 'Zulu' },
+    { code: 'xh', name: 'Xhosa' },
+    { code: 'af', name: 'Afrikaans' },
+    { code: 'sq', name: 'Albanian' },
+    { code: 'eu', name: 'Basque' },
+    { code: 'ca', name: 'Catalan' },
+    { code: 'gl', name: 'Galician' },
+    { code: 'cy', name: 'Welsh' },
+    { code: 'ga', name: 'Irish' },
+    { code: 'gd', name: 'Scottish Gaelic' },
+    { code: 'mt', name: 'Maltese' },
+    { code: 'is', name: 'Icelandic' },
+    { code: 'fo', name: 'Faroese' }
   ];
 
   // Initialize API connection and fetch available languages
@@ -117,15 +307,21 @@ const LanguageTranslator = () => {
         throw new Error('Backend API is not available. Please ensure the server is running.');
       }
 
+      // Get user email for API call
+      const currentUserEmail = currentUser?.email || 'anonymous@translator.app';
+
       const response = await fetch(`${API_BASE_URL}/translate`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'X-User-Email': currentUserEmail
         },
         body: JSON.stringify({
           text: text,
           source_lang: sourceLang,
-          target_lang: targetLang
+          target_lang: targetLang,
+          user_email: currentUserEmail,
+          translation_type: 'text'
         })
       });
 
@@ -270,81 +466,183 @@ const LanguageTranslator = () => {
   };
 
   const swapLanguages = () => {
-    setSourceLang(targetLang);
-    setTargetLang(sourceLang);
+    const newSourceLang = targetLang;
+    const newTargetLang = sourceLang;
+    
+    setSourceLang(newSourceLang);
+    setTargetLang(newTargetLang);
     setTextInput(textOutput);
     setTextOutput(textInput);
+    
+    // Save preferences for the swapped languages
+    if (currentUser?.email) {
+      saveUserPreference('preferred_source_lang', newSourceLang, 'translation');
+      saveUserPreference('preferred_target_lang', newTargetLang, 'translation');
+    }
+  };
+
+  const getLanguageCode = (lang) => {
+    const langMap = {
+      'en': 'en-US', 'es': 'es-ES', 'fr': 'fr-FR', 'de': 'de-DE',
+      'it': 'it-IT', 'pt': 'pt-PT', 'ru': 'ru-RU', 'ja': 'ja-JP',
+      'ko': 'ko-KR', 'zh': 'zh-CN', 'zh-tw': 'zh-TW', 'ar': 'ar-SA', 
+      'hi': 'hi-IN', 'bn': 'bn-BD', 'ta': 'ta-IN', 'te': 'te-IN',
+      'ml': 'ml-IN', 'kn': 'kn-IN', 'gu': 'gu-IN', 'mr': 'mr-IN',
+      'pa': 'pa-IN', 'ur': 'ur-PK', 'si': 'si-LK', 'th': 'th-TH',
+      'vi': 'vi-VN', 'id': 'id-ID', 'ms': 'ms-MY', 'tl': 'tl-PH',
+      'sw': 'sw-KE', 'tr': 'tr-TR', 'pl': 'pl-PL', 'nl': 'nl-NL',
+      'sv': 'sv-SE', 'da': 'da-DK', 'no': 'no-NO', 'fi': 'fi-FI',
+      'is': 'is-IS', 'cs': 'cs-CZ', 'sk': 'sk-SK', 'hu': 'hu-HU',
+      'ro': 'ro-RO', 'bg': 'bg-BG', 'hr': 'hr-HR', 'sr': 'sr-RS',
+      'sl': 'sl-SI', 'lt': 'lt-LT', 'lv': 'lv-LV', 'et': 'et-EE',
+      'uk': 'uk-UA', 'be': 'be-BY', 'ka': 'ka-GE', 'am': 'am-ET',
+      'he': 'he-IL', 'fa': 'fa-IR', 'ps': 'ps-AF', 'ku': 'ku-TR',
+      'az': 'az-AZ', 'uz': 'uz-UZ', 'kk': 'kk-KZ', 'ky': 'ky-KG',
+      'tg': 'tg-TJ', 'mn': 'mn-MN', 'my': 'my-MM', 'km': 'km-KH',
+      'lo': 'lo-LA', 'ne': 'ne-NP', 'dz': 'dz-BT', 'bo': 'bo-CN',
+      'yo': 'yo-NG', 'ig': 'ig-NG', 'ha': 'ha-NG', 'zu': 'zu-ZA',
+      'xh': 'xh-ZA', 'af': 'af-ZA', 'sq': 'sq-AL', 'eu': 'eu-ES',
+      'ca': 'ca-ES', 'gl': 'gl-ES', 'cy': 'cy-GB', 'ga': 'ga-IE',
+      'gd': 'gd-GB', 'mt': 'mt-MT', 'fo': 'fo-FO'
+    };
+    return langMap[lang] || 'en-US';
   };
 
   const startRecording = () => {
-    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+    if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) {
+      setError('Speech recognition is not supported in your browser. Please use Chrome, Edge, or Safari.');
+      return;
+    }
+
+    // Clear previous errors and transcript
+    setError('');
+    setAudioTranscript('');
+    setAudioTranslation('');
+
+    try {
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       const recognition = new SpeechRecognition();
       
-      recognition.continuous = true;
+      // Configure recognition
+      recognition.continuous = false;  // Changed to false for better control
       recognition.interimResults = true;
-      recognition.lang = sourceLang === 'en' ? 'en-US' : 
-                         sourceLang === 'es' ? 'es-ES' :
-                         sourceLang === 'fr' ? 'fr-FR' :
-                         sourceLang === 'de' ? 'de-DE' :
-                         sourceLang === 'it' ? 'it-IT' :
-                         sourceLang === 'pt' ? 'pt-PT' :
-                         sourceLang === 'ru' ? 'ru-RU' :
-                         sourceLang === 'ja' ? 'ja-JP' :
-                         sourceLang === 'ko' ? 'ko-KR' :
-                         sourceLang === 'zh' ? 'zh-CN' :
-                         sourceLang === 'ar' ? 'ar-SA' :
-                         sourceLang === 'hi' ? 'hi-IN' : 'en-US';
+      recognition.maxAlternatives = 1;
+      recognition.lang = getLanguageCode(sourceLang);
+      
+      let finalTranscript = '';
+      let interimTranscript = '';
+
+      recognition.onstart = () => {
+        setIsRecording(true);
+        setError('');
+        console.log('Speech recognition started');
+      };
 
       recognition.onresult = (event) => {
-        let transcript = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          transcript += event.results[i][0].transcript;
+        finalTranscript = '';
+        interimTranscript = '';
+        
+        for (let i = 0; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            finalTranscript += transcript;
+          } else {
+            interimTranscript += transcript;
+          }
         }
-        setAudioTranscript(transcript);
+        
+        const currentTranscript = finalTranscript || interimTranscript;
+        setAudioTranscript(currentTranscript);
       };
 
       recognition.onerror = (event) => {
         console.error('Speech recognition error:', event.error);
         setIsRecording(false);
+        
+        switch (event.error) {
+          case 'no-speech':
+            setError('No speech detected. Please try again and speak clearly.');
+            break;
+          case 'audio-capture':
+            setError('Microphone access denied or not available.');
+            break;
+          case 'not-allowed':
+            setError('Microphone permission denied. Please allow microphone access.');
+            break;
+          case 'network':
+            setError('Network error. Please check your internet connection.');
+            break;
+          case 'service-not-allowed':
+            setError('Speech recognition service not available.');
+            break;
+          default:
+            setError(`Speech recognition error: ${event.error}`);
+        }
       };
 
       recognition.onend = () => {
         setIsRecording(false);
+        console.log('Speech recognition ended');
+        
+        // If we have a transcript, automatically translate it
+        if (finalTranscript.trim()) {
+          handleVoiceTranslation(finalTranscript.trim());
+        } else if (interimTranscript.trim()) {
+          handleVoiceTranslation(interimTranscript.trim());
+        }
       };
 
       recognition.start();
       recognitionRef.current = recognition;
-      setIsRecording(true);
-    } else {
-      alert('Speech recognition is not supported in your browser. Please use Chrome, Edge, or Safari.');
+      
+      // Set a timeout to auto-stop after 10 seconds
+      setTimeout(() => {
+        if (recognitionRef.current && isRecording) {
+          recognition.stop();
+        }
+      }, 10000);
+      
+    } catch (error) {
+      console.error('Failed to start speech recognition:', error);
+      setError('Failed to start speech recognition. Please try again.');
+      setIsRecording(false);
     }
   };
 
-  const stopRecording = async () => {
+  const handleVoiceTranslation = async (transcript) => {
+    if (!transcript.trim()) return;
+    
+    try {
+      setIsTranslating(true);
+      const translation = await translateText(transcript);
+      setAudioTranslation(translation);
+      
+      // Add to history
+      const historyItem = {
+        id: Date.now(),
+        original: transcript,
+        translated: translation,
+        from: sourceLang,
+        to: targetLang,
+        date: new Date().toLocaleDateString(),
+        time: new Date().toLocaleTimeString()
+      };
+      
+      setHistory(prev => [historyItem, ...prev]);
+    } catch (error) {
+      console.error('Translation error:', error);
+      setError('Translation failed. Please try again.');
+    } finally {
+      setIsTranslating(false);
+    }
+  };
+
+  const stopRecording = () => {
     if (recognitionRef.current) {
       recognitionRef.current.stop();
-      setIsRecording(false);
-      
-      if (audioTranscript) {
-        setIsTranslating(true);
-        const translation = await translateText(audioTranscript);
-        setAudioTranslation(translation);
-        setIsTranslating(false);
-
-        const historyItem = {
-          id: Date.now(),
-          original: audioTranscript,
-          translated: translation,
-          from: sourceLang,
-          to: targetLang,
-          date: new Date().toLocaleDateString(),
-          time: new Date().toLocaleTimeString()
-        };
-        
-        setHistory(prev => [historyItem, ...prev]);
-      }
+      recognitionRef.current = null;
     }
+    setIsRecording(false);
   };
 
   const speakText = (text, lang) => {
@@ -403,7 +701,7 @@ const LanguageTranslator = () => {
 
   // If not authenticated, show login page
   if (!isAuthenticated) {
-    return <LoginPage onLoginSuccess={handleLoginSuccess} />;
+    return <LoginPage onLogin={handleLoginSuccess} />;
   }
 
   return (
@@ -591,7 +889,7 @@ const LanguageTranslator = () => {
                   <label className="text-sm font-medium text-gray-700">From:</label>
                   <select
                     value={sourceLang}
-                    onChange={(e) => setSourceLang(e.target.value)}
+                    onChange={(e) => handleSourceLangChange(e.target.value)}
                     className="border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
                   >
                     {languages.map(lang => (
@@ -614,7 +912,7 @@ const LanguageTranslator = () => {
                   <label className="text-sm font-medium text-gray-700">To:</label>
                   <select
                     value={targetLang}
-                    onChange={(e) => setTargetLang(e.target.value)}
+                    onChange={(e) => handleTargetLangChange(e.target.value)}
                     className="border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
                   >
                     {languages.map(lang => (
@@ -716,7 +1014,7 @@ const LanguageTranslator = () => {
                   <label className="text-sm font-medium text-gray-700">Speak in:</label>
                   <select
                     value={sourceLang}
-                    onChange={(e) => setSourceLang(e.target.value)}
+                    onChange={(e) => handleSourceLangChange(e.target.value)}
                     className="border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
                   >
                     {languages.map(lang => (
@@ -731,7 +1029,7 @@ const LanguageTranslator = () => {
                   <label className="text-sm font-medium text-gray-700">Translate to:</label>
                   <select
                     value={targetLang}
-                    onChange={(e) => setTargetLang(e.target.value)}
+                    onChange={(e) => handleTargetLangChange(e.target.value)}
                     className="border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
                   >
                     {languages.map(lang => (
@@ -878,7 +1176,7 @@ const LanguageTranslator = () => {
                 <label className="text-sm font-medium text-gray-700">From:</label>
                 <select
                   value={sourceLang}
-                  onChange={(e) => setSourceLang(e.target.value)}
+                  onChange={(e) => handleSourceLangChange(e.target.value)}
                   className="border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
                 >
                   {languages.map(lang => (
@@ -893,7 +1191,7 @@ const LanguageTranslator = () => {
                 <label className="text-sm font-medium text-gray-700">To:</label>
                 <select
                   value={targetLang}
-                  onChange={(e) => setTargetLang(e.target.value)}
+                  onChange={(e) => handleTargetLangChange(e.target.value)}
                   className="border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
                 >
                   {languages.map(lang => (

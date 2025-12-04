@@ -41,10 +41,17 @@ except ImportError:
 # Import database modules
 try:
     from database import db, translation_repo
-    DATABASE_AVAILABLE = False
+    DATABASE_AVAILABLE = True
+    print(f"Database import successful: db={db}, translation_repo={translation_repo}")
 except ImportError as e:
+    print(f"Database import failed: {e}")
     logger_temp = logging.getLogger(__name__)
     logger_temp.warning(f"Database module not available: {e}")
+    db = None
+    translation_repo = None
+    DATABASE_AVAILABLE = False
+except Exception as e:
+    print(f"Unexpected error importing database: {e}")
     db = None
     translation_repo = None
     DATABASE_AVAILABLE = False
@@ -54,8 +61,15 @@ app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max request
 
-# Enable CORS
-CORS(app, resources={r"/api/*": {"origins": CORS_ORIGINS}})
+# Enable CORS with proper configuration for authentication endpoints
+CORS(app, resources={
+    r"/api/*": {
+        "origins": CORS_ORIGINS + ['http://localhost:3000', 'http://localhost:3001'],
+        "methods": ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+        "allow_headers": ['Content-Type', 'Authorization', 'X-User-Email'],
+        "supports_credentials": True
+    }
+})
 
 # Configure logging
 logging.basicConfig(
@@ -76,25 +90,37 @@ def get_translator():
     return Translator()
 
 # Initialize database connection
-if db is not None:
-    try:
-        if db.create_database_if_not_exists():
-            if db.connect():
-                db.create_tables()
-                DATABASE_AVAILABLE = True
-                logger.info("Database connected and initialized successfully")
+def initialize_database():
+    """Initialize database connection and return status"""
+    global DATABASE_AVAILABLE
+    
+    if db is not None:
+        try:
+            if db.create_database_if_not_exists():
+                if db.connect():
+                    db.create_tables()
+                    DATABASE_AVAILABLE = True
+                    logger.info("Database connected and initialized successfully")
+                    return True
+                else:
+                    logger.warning("⚠ Could not connect to database - running in memory mode")
+                    DATABASE_AVAILABLE = False
+                    return False
             else:
-                logger.warning("⚠ Could not connect to database - running in memory mode")
+                logger.warning("⚠ Could not create database - running in memory mode")
                 DATABASE_AVAILABLE = False
-        else:
-            logger.warning("⚠ Could not create database - running in memory mode")
+                return False
+        except Exception as e:
+            logger.warning(f"⚠ Database initialization failed: {e} - running in memory mode")
             DATABASE_AVAILABLE = False
-    except Exception as e:
-        logger.warning(f"⚠ Database initialization failed: {e} - running in memory mode")
+            return False
+    else:
+        logger.warning("⚠ Database module not available - running in memory mode")
         DATABASE_AVAILABLE = False
-else:
-    logger.warning("⚠ Database module not available - running in memory mode")
-    DATABASE_AVAILABLE = False
+        return False
+
+# Initialize database
+initialize_database()
 
 # Cache language mappings
 @lru_cache(maxsize=1)
@@ -258,17 +284,49 @@ def translate():
         # Save to database if available
         if DATABASE_AVAILABLE and translation_repo:
             try:
-                user_id = None  # Anonymous user for now
-                translation_repo.save_translation(
-                    user_id=user_id,
-                    source_lang=source_lang,
-                    target_lang=target_lang,
-                    original_text=text,
-                    translated_text=translated_text,
-                    character_count=len(text),
-                    translation_time_ms=translation_time_ms,
-                    model_used='googletrans'
-                )
+                # Get user email from request headers or use anonymous
+                user_email = request.headers.get('X-User-Email') or data.get('user_email') or 'anonymous@translator.app'
+                
+                # Get client info
+                ip_address = request.remote_addr
+                user_agent = request.headers.get('User-Agent')
+                
+                # Create or get user
+                user = translation_repo.create_or_get_user(user_email)
+                
+                if user:
+                    # Save translation
+                    translation_repo.save_translation(
+                        user_email=user_email,
+                        source_lang=source_lang,
+                        target_lang=target_lang,
+                        original_text=text,
+                        translated_text=translated_text,
+                        translation_type='text',
+                        character_count=len(text),
+                        translation_time_ms=translation_time_ms,
+                        confidence_score=getattr(result, 'confidence', 0.0) if result else 0.0,
+                        ip_address=ip_address,
+                        user_agent=user_agent
+                    )
+                    
+                    # Log API action
+                    translation_repo.log_system_action(
+                        user_email=user_email,
+                        action='translate_text',
+                        endpoint='/api/translate',
+                        method='POST',
+                        status_code=200,
+                        response_time_ms=translation_time_ms,
+                        ip_address=ip_address,
+                        user_agent=user_agent,
+                        request_data={
+                            'source_lang': source_lang,
+                            'target_lang': target_lang,
+                            'text_length': len(text)
+                        }
+                    )
+                    
             except Exception as db_error:
                 logger.warning(f"Could not save translation to database: {db_error}")
         
@@ -282,6 +340,7 @@ def translate():
             'source_lang_name': str(LANGUAGES.get(source_lang, '')),
             'target_lang_name': str(LANGUAGES.get(target_lang, '')),
             'translation_time_ms': int(translation_time_ms),
+            'character_count': len(text),
             'database_saved': DATABASE_AVAILABLE
         }
         
@@ -693,6 +752,835 @@ def database_status():
             'error': f'Database check failed: {str(e)}'
         }), 500
 
+# ============ User Management API Endpoints ============
+
+def is_database_available():
+    """Check if database is available"""
+    return DATABASE_AVAILABLE and db is not None and translation_repo is not None
+
+@app.route('/api/debug/database', methods=['GET'])
+def debug_database():
+    """Debug database availability"""
+    return jsonify({
+        'DATABASE_AVAILABLE': DATABASE_AVAILABLE,
+        'translation_repo_exists': translation_repo is not None,
+        'db_exists': db is not None,
+        'is_database_available': is_database_available(),
+        'condition_check': not DATABASE_AVAILABLE or not translation_repo
+    }), 200
+
+@app.route('/api/users/profile', methods=['GET', 'POST'])
+def user_profile():
+    """Get or update user profile"""
+    if not is_database_available():
+        return jsonify({
+            'success': False,
+            'error': 'Database is not available'
+        }), 503
+    
+    try:
+        user_email = request.headers.get('X-User-Email') or request.json.get('user_email') if request.json else None
+        
+        if not user_email:
+            return jsonify({
+                'success': False,
+                'error': 'User email is required in headers (X-User-Email) or request body'
+            }), 400
+        
+        if request.method == 'GET':
+            # Get comprehensive user profile with statistics
+            dashboard_data = translation_repo.get_user_dashboard_data(user_email)
+            if dashboard_data:
+                # Also get comprehensive statistics
+                comprehensive_stats = translation_repo.get_comprehensive_user_statistics(user_email, '30')
+                
+                profile_data = {
+                    'user_info': dashboard_data['user_info'],
+                    'quick_stats': dashboard_data['quick_stats'],
+                    'recent_activity': dashboard_data.get('recent_translations', [])[:5],  # Last 5 translations
+                    'top_language_pairs': dashboard_data.get('top_language_pairs', []),
+                    'statistics_summary': {
+                        'last_30_days': {
+                            'total_translations': comprehensive_stats['overall_statistics']['total_translations'] if comprehensive_stats else 0,
+                            'total_characters': comprehensive_stats['overall_statistics']['total_characters'] if comprehensive_stats else 0,
+                            'active_days': comprehensive_stats['overall_statistics']['active_days'] if comprehensive_stats else 0,
+                            'avg_translation_time': comprehensive_stats['overall_statistics']['avg_translation_time_ms'] if comprehensive_stats else 0
+                        } if comprehensive_stats else {}
+                    }
+                }
+                
+                return jsonify({
+                    'success': True,
+                    'profile': profile_data,
+                    'generated_at': datetime.now().isoformat()
+                }), 200
+            else:
+                return jsonify({
+                    'success': False,
+                    'error': 'User not found'
+                }), 404
+        
+        elif request.method == 'POST':
+            # Update user preferences
+            data = request.get_json()
+            source_lang = data.get('preferred_source_lang')
+            target_lang = data.get('preferred_target_lang')
+            full_name = data.get('full_name')
+            
+            if full_name:
+                # Update full name
+                cursor = db.connection.cursor()
+                cursor.execute("UPDATE users SET full_name = %s WHERE email = %s", (full_name, user_email))
+                db.connection.commit()
+                cursor.close()
+            
+            if source_lang or target_lang:
+                success = translation_repo.update_user_preferences(user_email, source_lang, target_lang)
+                if not success:
+                    return jsonify({
+                        'success': False,
+                        'error': 'Failed to update preferences'
+                    }), 500
+            
+            return jsonify({
+                'success': True,
+                'message': 'Profile updated successfully'
+            }), 200
+    
+    except Exception as e:
+        logger.error(f"Error in user profile: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Profile operation failed: {str(e)}'
+        }), 500
+
+@app.route('/api/users/history', methods=['GET'])
+def user_history():
+    """Get user's translation history with pagination"""
+    if not DATABASE_AVAILABLE or not translation_repo:
+        return jsonify({
+            'success': False,
+            'error': 'Database is not available'
+        }), 503
+    
+    try:
+        user_email = request.headers.get('X-User-Email') or request.args.get('user_email')
+        
+        if not user_email:
+            return jsonify({
+                'success': False,
+                'error': 'User email is required in headers (X-User-Email) or query parameters'
+            }), 400
+        
+        # Get pagination parameters
+        page = int(request.args.get('page', 1))
+        per_page = min(int(request.args.get('per_page', 20)), 100)  # Max 100 per page
+        offset = (page - 1) * per_page
+        
+        # Get translation type filter
+        translation_type = request.args.get('type')  # 'text' or 'speech'
+        
+        translations = translation_repo.get_user_translations(user_email, per_page, offset)
+        
+        return jsonify({
+            'success': True,
+            'translations': translations,
+            'pagination': {
+                'page': page,
+                'per_page': per_page,
+                'has_more': len(translations) == per_page
+            }
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Error getting user history: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to get history: {str(e)}'
+        }), 500
+
+@app.route('/api/users/history/search', methods=['GET'])
+def search_user_history():
+    """Search user's translation history"""
+    if not DATABASE_AVAILABLE or not translation_repo:
+        return jsonify({
+            'success': False,
+            'error': 'Database is not available'
+        }), 503
+    
+    try:
+        user_email = request.headers.get('X-User-Email') or request.args.get('user_email')
+        search_query = request.args.get('q', '').strip()
+        
+        if not user_email:
+            return jsonify({
+                'success': False,
+                'error': 'User email is required in headers (X-User-Email) or query parameters'
+            }), 400
+        
+        if not search_query:
+            return jsonify({
+                'success': False,
+                'error': 'Search query (q) is required'
+            }), 400
+        
+        limit = min(int(request.args.get('limit', 50)), 100)  # Max 100 results
+        
+        results = translation_repo.search_translations(user_email, search_query, limit)
+        
+        return jsonify({
+            'success': True,
+            'results': results,
+            'query': search_query,
+            'count': len(results)
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Error searching user history: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Search failed: {str(e)}'
+        }), 500
+
+@app.route('/api/users/history/clear', methods=['POST'])
+def clear_user_history():
+    """Clear user's translation history"""
+    if not DATABASE_AVAILABLE or not translation_repo:
+        return jsonify({
+            'success': False,
+            'error': 'Database is not available'
+        }), 503
+    
+    try:
+        user_email = request.headers.get('X-User-Email') or request.json.get('user_email') if request.json else None
+        
+        if not user_email:
+            return jsonify({
+                'success': False,
+                'error': 'User email is required in headers (X-User-Email) or request body'
+            }), 400
+        
+        # Require confirmation
+        confirm = request.args.get('confirm', 'false').lower() == 'true'
+        
+        if not confirm:
+            return jsonify({
+                'success': False,
+                'error': 'Confirmation required. Add ?confirm=true to proceed'
+            }), 400
+        
+        # Delete user's translations
+        cursor = db.connection.cursor()
+        cursor.execute("DELETE FROM translations WHERE user_email = %s", (user_email,))
+        deleted_count = cursor.rowcount
+        
+        # Reset user stats
+        cursor.execute("""
+            UPDATE users SET 
+                total_translations = 0,
+                total_characters = 0
+            WHERE email = %s
+        """, (user_email,))
+        
+        # Clear language stats
+        cursor.execute("DELETE FROM user_language_stats WHERE user_email = %s", (user_email,))
+        
+        db.connection.commit()
+        cursor.close()
+        
+        return jsonify({
+            'success': True,
+            'message': 'History cleared successfully',
+            'deleted_count': deleted_count
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Error clearing user history: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to clear history: {str(e)}'
+        }), 500
+
+@app.route('/api/users/statistics', methods=['GET'])
+def get_user_statistics():
+    """Get comprehensive user statistics including daily, weekly, monthly breakdowns"""
+    if not DATABASE_AVAILABLE or not translation_repo:
+        return jsonify({
+            'success': False,
+            'error': 'Database is not available'
+        }), 503
+    
+    try:
+        user_email = request.headers.get('X-User-Email') or request.args.get('user_email')
+        
+        if not user_email:
+            return jsonify({
+                'success': False,
+                'error': 'User email is required in headers (X-User-Email) or query parameters'
+            }), 400
+        
+        # Get time period parameter (default: 30 days)
+        period = request.args.get('period', '30').lower()
+        if period not in ['7', '30', '90', 'all']:
+            period = '30'
+        
+        stats = translation_repo.get_comprehensive_user_statistics(user_email, period)
+        
+        if stats:
+            return jsonify({
+                'success': True,
+                'statistics': stats,
+                'period': period,
+                'generated_at': datetime.now().isoformat()
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'User not found or no statistics available'
+            }), 404
+    
+    except Exception as e:
+        logger.error(f"Error getting user statistics: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to get statistics: {str(e)}'
+        }), 500
+
+@app.route('/api/users/analytics/daily', methods=['GET'])
+def get_daily_analytics():
+    """Get daily translation analytics for a user"""
+    if not DATABASE_AVAILABLE or not translation_repo:
+        return jsonify({
+            'success': False,
+            'error': 'Database is not available'
+        }), 503
+    
+    try:
+        user_email = request.headers.get('X-User-Email') or request.args.get('user_email')
+        
+        if not user_email:
+            return jsonify({
+                'success': False,
+                'error': 'User email is required'
+            }), 400
+        
+        days = min(int(request.args.get('days', 30)), 365)  # Max 1 year
+        
+        analytics = translation_repo.get_daily_analytics(user_email, days)
+        
+        return jsonify({
+            'success': True,
+            'analytics': analytics,
+            'days': days,
+            'user_email': user_email
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Error getting daily analytics: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to get daily analytics: {str(e)}'
+        }), 500
+
+@app.route('/api/users/analytics/languages', methods=['GET'])
+def get_language_analytics():
+    """Get language usage analytics for a user"""
+    if not DATABASE_AVAILABLE or not translation_repo:
+        return jsonify({
+            'success': False,
+            'error': 'Database is not available'
+        }), 503
+    
+    try:
+        user_email = request.headers.get('X-User-Email') or request.args.get('user_email')
+        
+        if not user_email:
+            return jsonify({
+                'success': False,
+                'error': 'User email is required'
+            }), 400
+        
+        analytics = translation_repo.get_language_analytics(user_email)
+        
+        return jsonify({
+            'success': True,
+            'analytics': analytics,
+            'user_email': user_email
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Error getting language analytics: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to get language analytics: {str(e)}'
+        }), 500
+
+@app.route('/api/users/dashboard', methods=['GET'])
+def get_user_dashboard():
+    """Get comprehensive user dashboard data combining statistics, recent activity, and preferences"""
+    if not DATABASE_AVAILABLE or not translation_repo:
+        return jsonify({
+            'success': False,
+            'error': 'Database is not available'
+        }), 503
+    
+    try:
+        user_email = request.headers.get('X-User-Email') or request.args.get('user_email')
+        
+        if not user_email:
+            return jsonify({
+                'success': False,
+                'error': 'User email is required'
+            }), 400
+        
+        dashboard_data = translation_repo.get_user_dashboard_data(user_email)
+        
+        if dashboard_data:
+            return jsonify({
+                'success': True,
+                'dashboard': dashboard_data,
+                'generated_at': datetime.now().isoformat()
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'User not found'
+            }), 404
+    
+    except Exception as e:
+        logger.error(f"Error getting user dashboard: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to get dashboard data: {str(e)}'
+        }), 500
+
+# ============ User Management Endpoints ============
+
+@app.route('/api/auth/register', methods=['POST'])
+def register_user():
+    """Register a new user"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'No JSON data provided'}), 400
+        
+        # Validate required fields
+        email = data.get('email', '').strip().lower()
+        password = data.get('password', '').strip()
+        first_name = data.get('firstName', '').strip()
+        last_name = data.get('lastName', '').strip()
+        
+        if not all([email, password, first_name, last_name]):
+            return jsonify({
+                'success': False, 
+                'error': 'Email, password, firstName, and lastName are required'
+            }), 400
+        
+        # Basic email validation
+        import re
+        if not re.match(r'^[^\s@]+@[^\s@]+\.[^\s@]+$', email):
+            return jsonify({'success': False, 'error': 'Invalid email format'}), 400
+        
+        if len(password) < 6:
+            return jsonify({'success': False, 'error': 'Password must be at least 6 characters'}), 400
+        
+        if DATABASE_AVAILABLE and translation_repo:
+            try:
+                # Check if user already exists
+                existing_user = translation_repo.get_user_by_email(email)
+                if existing_user:
+                    return jsonify({'success': False, 'error': 'User already exists with this email'}), 409
+                
+                # Create user
+                user_data = {
+                    'email': email,
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'password_hash': password  # In production, hash this!
+                }
+                
+                user_id = translation_repo.create_user(user_data)
+                
+                if user_id:
+                    # Get the created user
+                    user = translation_repo.get_user_by_email(email)
+                    logger.info(f"New user registered: {email}")
+                    
+                    return jsonify({
+                        'success': True,
+                        'message': 'User registered successfully',
+                        'user': {
+                            'id': str(user_id),
+                            'email': user['email'],
+                            'firstName': user['first_name'],
+                            'lastName': user['last_name'],
+                            'fullName': f"{user['first_name']} {user['last_name']}"
+                        }
+                    }), 201
+                else:
+                    return jsonify({'success': False, 'error': 'Failed to create user'}), 500
+                    
+            except Exception as e:
+                logger.error(f"Database error during registration: {str(e)}")
+                return jsonify({'success': False, 'error': 'Database error occurred'}), 500
+        else:
+            # Fallback: simulate user creation when database not available
+            logger.warning("Database not available, simulating user registration")
+            return jsonify({
+                'success': True,
+                'message': 'User registered successfully (simulation mode)',
+                'user': {
+                    'id': str(int(time.time())),
+                    'email': email,
+                    'firstName': first_name,
+                    'lastName': last_name,
+                    'fullName': f"{first_name} {last_name}"
+                }
+            }), 201
+            
+    except Exception as e:
+        logger.error(f"Error during user registration: {str(e)}")
+        return jsonify({'success': False, 'error': 'Registration failed'}), 500
+
+@app.route('/api/auth/login', methods=['POST'])
+def login_user():
+    """Login user"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'No JSON data provided'}), 400
+        
+        email = data.get('email', '').strip().lower()
+        password = data.get('password', '').strip()
+        
+        if not email or not password:
+            return jsonify({'success': False, 'error': 'Email and password are required'}), 400
+        
+        # Demo user check
+        if email == 'demo@translator.com' and password == 'demo123':
+            return jsonify({
+                'success': True,
+                'message': 'Login successful',
+                'user': {
+                    'id': '1',
+                    'email': email,
+                    'firstName': 'Demo',
+                    'lastName': 'User',
+                    'fullName': 'Demo User'
+                }
+            }), 200
+        
+        if is_database_available():
+            try:
+                user = translation_repo.get_user_by_email(email)
+                if user and user.get('password_hash') == password:  # In production, use proper password hashing!
+                    logger.info(f"User logged in: {email}")
+                    return jsonify({
+                        'success': True,
+                        'message': 'Login successful',
+                        'user': {
+                            'id': user['email'],  # Use email as ID since it's the primary key
+                            'email': user['email'],
+                            'firstName': user['first_name'],
+                            'lastName': user['last_name'],
+                            'fullName': f"{user['first_name']} {user['last_name']}"
+                        }
+                    }), 200
+                else:
+                    return jsonify({'success': False, 'error': 'Invalid email or password'}), 401
+                    
+            except Exception as e:
+                logger.error(f"Database error during login: {str(e)}")
+                return jsonify({'success': False, 'error': 'Login failed'}), 500
+        else:
+            return jsonify({'success': False, 'error': 'Authentication service unavailable'}), 503
+            
+    except Exception as e:
+        logger.error(f"Error during user login: {str(e)}")
+        return jsonify({'success': False, 'error': 'Login failed'}), 500
+
+
+# ============ User Preferences Management ============
+
+@app.route('/api/users/preferences', methods=['GET', 'POST', 'PUT'])
+def manage_user_preferences():
+    """Manage user preferences - GET, POST, or PUT"""
+    if not DATABASE_AVAILABLE or not translation_repo:
+        return jsonify({
+            'success': False,
+            'error': 'Database is not available'
+        }), 503
+    
+    try:
+        user_email = request.headers.get('X-User-Email') or (request.json.get('user_email') if request.json else None)
+        
+        if not user_email:
+            return jsonify({
+                'success': False,
+                'error': 'User email is required in headers (X-User-Email) or request body'
+            }), 400
+        
+        if request.method == 'GET':
+            # Get all user preferences
+            preferences = translation_repo.get_all_user_preferences(user_email)
+            return jsonify({
+                'success': True,
+                'preferences': preferences,
+                'user_email': user_email
+            }), 200
+            
+        elif request.method in ['POST', 'PUT']:
+            # Set or update preferences
+            data = request.json
+            if not data:
+                return jsonify({
+                    'success': False,
+                    'error': 'Request body is required'
+                }), 400
+            
+            results = {}
+            
+            # Handle multiple preferences in one request
+            if 'preferences' in data:
+                for category, prefs in data['preferences'].items():
+                    if not isinstance(prefs, dict):
+                        continue
+                    for key, value in prefs.items():
+                        success = translation_repo.set_user_preference(user_email, key, value, category)
+                        results[f"{category}.{key}"] = success
+            
+            # Handle single preference
+            elif 'key' in data and 'value' in data:
+                key = data['key']
+                value = data['value']
+                category = data.get('category', 'general')
+                success = translation_repo.set_user_preference(user_email, key, value, category)
+                results[key] = success
+            
+            else:
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid request format. Use "preferences" for bulk or "key"/"value" for single preference'
+                }), 400
+            
+            return jsonify({
+                'success': True,
+                'updated_preferences': results,
+                'user_email': user_email
+            }), 200
+        
+    except Exception as e:
+        logger.error(f"Error managing preferences: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to manage preferences: {str(e)}'
+        }), 500
+
+
+@app.route('/api/users/preferences/<preference_key>', methods=['GET', 'PUT', 'DELETE'])
+def manage_single_preference(preference_key):
+    """Manage a single user preference"""
+    if not DATABASE_AVAILABLE or not translation_repo:
+        return jsonify({
+            'success': False,
+            'error': 'Database is not available'
+        }), 503
+    
+    try:
+        user_email = request.headers.get('X-User-Email') or (request.json.get('user_email') if request.json else None)
+        
+        if not user_email:
+            return jsonify({
+                'success': False,
+                'error': 'User email is required in headers (X-User-Email) or request body'
+            }), 400
+        
+        if request.method == 'GET':
+            # Get specific preference
+            default_value = request.args.get('default')
+            value = translation_repo.get_user_preference(user_email, preference_key, default_value)
+            return jsonify({
+                'success': True,
+                'preference': {
+                    'key': preference_key,
+                    'value': value,
+                    'user_email': user_email
+                }
+            }), 200
+            
+        elif request.method == 'PUT':
+            # Update specific preference
+            data = request.json
+            if not data or 'value' not in data:
+                return jsonify({
+                    'success': False,
+                    'error': 'Request body with "value" field is required'
+                }), 400
+            
+            value = data['value']
+            category = data.get('category', 'general')
+            success = translation_repo.set_user_preference(user_email, preference_key, value, category)
+            
+            return jsonify({
+                'success': success,
+                'preference': {
+                    'key': preference_key,
+                    'value': value,
+                    'category': category
+                }
+            }), 200 if success else 500
+        
+        # Note: DELETE functionality would require adding a delete method to the repository
+        
+    except Exception as e:
+        logger.error(f"Error managing single preference: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to manage preference: {str(e)}'
+        }), 500
+
+
+@app.route('/api/users/favorites/language-pairs', methods=['GET', 'POST'])
+def manage_favorite_language_pairs():
+    """Manage user's favorite language pairs"""
+    if not DATABASE_AVAILABLE or not translation_repo:
+        return jsonify({
+            'success': False,
+            'error': 'Database is not available'
+        }), 503
+    
+    try:
+        user_email = request.headers.get('X-User-Email') or (request.json.get('user_email') if request.json else None)
+        
+        if not user_email:
+            return jsonify({
+                'success': False,
+                'error': 'User email is required'
+            }), 400
+        
+        if request.method == 'GET':
+            # Get user's language pair statistics including favorites
+            analytics = translation_repo.get_language_analytics(user_email)
+            
+            # Filter for favorite pairs
+            favorite_pairs = [
+                pair for pair in analytics.get('language_pairs', [])
+                if pair.get('is_favorite', False)
+            ]
+            
+            return jsonify({
+                'success': True,
+                'favorite_pairs': favorite_pairs,
+                'all_pairs': analytics.get('language_pairs', [])
+            }), 200
+            
+        elif request.method == 'POST':
+            # Set favorite language pair
+            data = request.json
+            if not data or 'language_pair' not in data:
+                return jsonify({
+                    'success': False,
+                    'error': 'Request body with "language_pair" field is required'
+                }), 400
+            
+            language_pair = data['language_pair']
+            is_favorite = data.get('is_favorite', True)
+            
+            success = translation_repo.set_favorite_language_pair(user_email, language_pair, is_favorite)
+            
+            return jsonify({
+                'success': success,
+                'language_pair': language_pair,
+                'is_favorite': is_favorite
+            }), 200 if success else 500
+        
+    except Exception as e:
+        logger.error(f"Error managing favorite language pairs: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to manage favorites: {str(e)}'
+        }), 500
+
+
+@app.route('/api/users/profile/sync', methods=['POST'])
+def sync_user_profile():
+    """Sync user profile data after login to ensure all data is persistent"""
+    if not DATABASE_AVAILABLE or not translation_repo:
+        return jsonify({
+            'success': False,
+            'error': 'Database is not available'
+        }), 503
+    
+    try:
+        user_email = request.headers.get('X-User-Email') or (request.json.get('user_email') if request.json else None)
+        
+        if not user_email:
+            return jsonify({
+                'success': False,
+                'error': 'User email is required'
+            }), 400
+        
+        # Get comprehensive user data
+        dashboard_data = translation_repo.get_user_dashboard_data(user_email)
+        
+        if dashboard_data:
+            # Set default preferences if they don't exist
+            preferences = dashboard_data.get('user_preferences', {})
+            
+            # Initialize default preferences if none exist
+            if not preferences:
+                default_prefs = {
+                    'ui': {
+                        'theme': 'light',
+                        'language': 'en',
+                        'auto_speak': False,
+                        'show_confidence': True
+                    },
+                    'translation': {
+                        'auto_detect': True,
+                        'save_history': True,
+                        'max_history_items': 100
+                    },
+                    'audio': {
+                        'enable_tts': True,
+                        'speech_rate': 'normal',
+                        'voice_preference': 'default'
+                    },
+                    'privacy': {
+                        'analytics_enabled': True,
+                        'share_anonymous_stats': True
+                    }
+                }
+                
+                # Set default preferences
+                for category, prefs in default_prefs.items():
+                    for key, value in prefs.items():
+                        translation_repo.set_user_preference(user_email, key, value, category)
+                
+                # Refresh dashboard data to include the new preferences
+                dashboard_data = translation_repo.get_user_dashboard_data(user_email)
+            
+            return jsonify({
+                'success': True,
+                'profile_data': dashboard_data,
+                'synced_at': datetime.now().isoformat()
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'User profile not found'
+            }), 404
+        
+    except Exception as e:
+        logger.error(f"Error syncing user profile: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to sync profile: {str(e)}'
+        }), 500
+
+
 # ============ Error Handlers ============
 
 @app.errorhandler(404)
@@ -732,5 +1620,5 @@ if __name__ == '__main__':
         host=HOST,
         port=PORT,
         debug=DEBUG,
-        use_reloader=DEBUG
+        use_reloader=False  # Temporarily disable reloader to fix database import issue
     )
